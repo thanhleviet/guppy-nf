@@ -3,9 +3,15 @@
 nextflow.enable.dsl=2
 
 process guppy_basecaller {
-    tag "${fast5.baseName}"
+    tag "${fast5.simpleName}"
+
+    maxForks 1
     
     cache true
+
+    errorStrategy { sleep(Math.pow(2, task.attempt) * 200 as long) ; task.attempt < 3 ? 'retry' : 'ignore' }
+    // errorStrategy { sleep(Math.pow(2, task.attempt) * 200 as long); return 'retry' }
+    maxRetries 3
 
     publishDir "${params.outdir}",
         mode: "copy",
@@ -16,21 +22,20 @@ process guppy_basecaller {
         path(fast5)
 
     output:
-        path("fastq/pass"), emit: fastq
-        tuple val(fast5.baseName), path("fastq/sequencing_summary.txt"), emit: sequencing_summary
+        path("*.fastq.gz"), optional: true, emit: fastq
     script:
         model = params.sup_model ? "dna_r9.4.1_450bps_sup.cfg" : "dna_r9.4.1_450bps_hac.cfg"
         chunks_per_runner = params.sup_model ? "" : "--chunks_per_runner ${params.chunks_per_runner}"
         """
-        guppy_basecaller --input_path $fast5 \\
-            -r \\
+        guppy_basecaller --input_path . \\
             --min_qscore ${params.min_qscore} \\
-            --save_path fastq \\
+            --save_path out \\
+            ${chunks_per_runner} \\
             --records_per_fastq 0 \\
-            --chunks_per_runner ${params.chunks_per_runner} \\
             --compress_fastq \\
             -c ${model} -x 'cuda:${params.cuda}' \\
             --num_callers ${params.num_callers}
+        mv -f out/pass/*.fastq.gz ${fast5.simpleName}.fastq.gz
         """
 }
 
@@ -45,7 +50,7 @@ process guppy_barcoder {
     
     cache true
 
-    cpus 64
+    cpus 48
 
     input:
     path("fastq")
@@ -64,7 +69,6 @@ process guppy_barcoder {
     -r \\
     -s $output \\
     -q 0 \\
-    $barcoder_options \\
     $barcode_kit \\
     $trim_barcodes \\
     -t ${task.cpus}
@@ -74,8 +78,8 @@ process guppy_barcoder {
     for f in barcode*;do echo \$f;cat \$f/*.fastq | pigz -p ${task.cpus} - > ../\${f}.fastq.gz;done
     cd ..
     if [[ -f '${params.map}' ]]; then
-        brename -e -p '(barcode[0-9]{2})' -r '{kv}' -k ${params.map} 2> /dev/null
-        cat <(zcat barcode*.gz  2> /dev/null) <(cat ${output}/unclassified/*.*) | pigz -p ${task.cpus} - > unclassified.fastq.gz
+        brename -e -p '(barcode[0-9]{2})' -r '{kv}' -k ${params.map}
+        cat <(zcat barcode*.gz) <(cat ${output}/unclassified/*.*) | pigz -p ${task.cpus} - > unclassified.fastq.gz
         rm barcode*.fastq.gz 2> /dev/null
     else
         cat ${output}/unclassified/*.* | pigz -p ${task.cpus} - > unclassified.fastq.gz
@@ -128,21 +132,8 @@ process MINIONQC {
     """
 }
 
-fast5 = Channel.fromPath(params.fast5, type: 'dir', checkIfExists: true)
-
-log.info "Input: " + params.fast5
+fast5 = Channel.watchPath(params.fast5, 'create')
 
 workflow {
-    if (params.basecall) {
-        guppy_basecaller(fast5)
-        fastq = guppy_basecaller.out.fastq
-        STATS_PYCOQC(guppy_basecaller.out.sequencing_summary)
-        MINIONQC(guppy_basecaller.out.sequencing_summary)
-    } else {
-        fastq = fast5
-    }
-  if (params.deplex) {
-      guppy_barcoder(fastq)
-  }
-  
+    guppy_basecaller(fast5)
 }
